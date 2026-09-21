@@ -76,6 +76,49 @@ unsubscribe();
 await queue.close({ drain: true });
 ```
 
+## Architecture
+
+```mermaid
+flowchart LR
+  application[Node.js application]
+  express[Express request]
+  middleware[Express middleware adapter]
+
+  subgraph lanepool[lanepool process]
+    api[Queue API]
+
+    subgraph memory[In-memory state]
+      pending[Pending job IDs]
+      jobs[Jobs and retained results]
+      keys[Active keys]
+      signal[Reactive snapshots]
+    end
+
+    workers[Worker pool]
+    task[Task with JobContext]
+    retention[Retention timer]
+  end
+
+  subscribers[Subscribers]
+
+  application -->|createQueue| api
+  express --> middleware -->|request.queue| api
+  api -->|add| pending
+  api -->|status and control| jobs
+  api -->|deduplicate| keys
+  pending -->|next pending job| workers
+  workers -->|up to concurrency| task
+  task -->|result, error, or cancellation| jobs
+  api -.->|AbortSignal| task
+  jobs --> signal --> subscribers
+  jobs --> retention -->|remove terminal job| jobs
+```
+
+Both entry points share the same queue core. The Express adapter only attaches a queue instance to
+each request; scheduling, key-based deduplication, cancellation, snapshots, and retention remain in
+the framework-neutral core. Workers run in the current Node.js process, so the queue and its retained
+job state are not shared across processes or persisted across restarts.
+
 ## Behaviour
 
 - Jobs are retained only in the current process.
