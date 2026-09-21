@@ -50,6 +50,8 @@ interface ResolvedQueueOptions {
 interface InternalJob {
   id: string;
   state: JobState;
+  attempt: number;
+  maxAttempts: number;
   key?: string;
   meta?: Readonly<Record<string, unknown>>;
   createdAt: Date;
@@ -108,6 +110,8 @@ const publicJob = (job: InternalJob): Job => {
   const snapshot: Job = {
     id: job.id,
     state: job.state,
+    attempt: job.attempt,
+    maxAttempts: job.maxAttempts,
     createdAt: new Date(job.createdAt),
     ...(job.key === undefined ? {} : { key: job.key }),
     ...(job.meta === undefined ? {} : { meta: Object.freeze({ ...job.meta }) }),
@@ -224,12 +228,14 @@ export const createQueue = (options: QueueOptions = {}): Queue => {
   };
   const runJob = async (job: InternalJob): Promise<void> => {
     job.state = 'running';
+    job.attempt += 1;
     job.startedAt = new Date();
     publish();
 
     const context: JobContext = Object.freeze({
       signal: job.controller.signal,
       jobId: job.id,
+      attempt: job.attempt,
       ...(job.key === undefined ? {} : { key: job.key }),
       ...(job.meta === undefined ? {} : { meta: job.meta }),
     });
@@ -249,6 +255,11 @@ export const createQueue = (options: QueueOptions = {}): Queue => {
     } catch (reason: unknown) {
       if (job.cancellationRequestedAt !== undefined) {
         finishJob(job, 'cancelled');
+      } else if (job.attempt < job.maxAttempts) {
+        job.state = 'pending';
+        job.startedAt = undefined;
+        pendingIds.push(job.id);
+        publish();
       } else {
         job.error = normalizeError(reason);
         finishJob(job, 'failed');
@@ -317,9 +328,12 @@ export const createQueue = (options: QueueOptions = {}): Queue => {
       }
 
       const id = randomUUID();
+      const maxAttempts = requireInteger('maxAttempts', addOptions.maxAttempts ?? 1, 1);
       const job: InternalJob = {
         id,
         state: 'pending',
+        attempt: 0,
+        maxAttempts,
         createdAt: new Date(),
         task,
         controller: new AbortController(),

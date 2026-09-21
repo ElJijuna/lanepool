@@ -46,6 +46,65 @@ app.get('/jobs/:id', (request, response) => {
 
 The Express type augmentation adds `queue` to `Express.Request` when this package is imported.
 
+### Asynchronous concurrent database writes
+
+Lanepool can move database writes out of the request lifecycle and process them concurrently with a
+controlled level of parallelism. In this webhook example, the event ID is used both as the active
+queue key and as a unique database key: the queue prevents concurrent duplicates, while the database
+constraint keeps later redeliveries idempotent.
+
+```ts
+import express from 'express';
+import { Pool } from 'pg';
+import { createQueueMiddleware } from 'lanepool';
+
+const app = express();
+const database = new Pool({ connectionString: process.env.DATABASE_URL });
+
+app.use(express.json());
+app.use(createQueueMiddleware({ concurrency: 4 }));
+
+app.post('/webhooks/orders', (request, response) => {
+  const event = request.body as {
+    id: string;
+    orderId: string;
+    total: number;
+  };
+
+  const jobId = request.queue.add(
+    async ({ attempt }) => {
+      await database.query({
+        text: `
+          INSERT INTO order_events (event_id, order_id, total, received_at)
+          VALUES ($1, $2, $3, NOW())
+          ON CONFLICT (event_id) DO NOTHING
+        `,
+        values: [event.id, event.orderId, event.total],
+      });
+
+      console.log(`Stored webhook ${event.id} on attempt ${attempt}`);
+    },
+    {
+      key: `webhook:${event.id}`,
+      maxAttempts: 2,
+      meta: { eventId: event.id },
+    },
+  );
+
+  response.status(202).json({ jobId });
+});
+```
+
+`maxAttempts: 2` means one initial execution and one retry. If the first execution throws, the job
+returns to `pending` at the end of the queue, allowing already queued work to run first. If the
+second execution also throws, the job becomes `failed` and its normalized error is retained. The
+active `key` remains reserved across attempts.
+
+This pattern acknowledges the webhook before the database write finishes. Because lanepool is
+in-memory, a process crash can lose accepted work; use a durable external queue when the webhook
+must have guaranteed delivery. The database operation should still be idempotent because providers
+can redeliver events after the original job has finished.
+
 ## Framework-neutral usage
 
 ```ts
@@ -109,6 +168,7 @@ flowchart LR
   pending -->|next pending job| workers
   workers -->|up to concurrency| task
   task -->|result, error, or cancellation| jobs
+  task -.->|retry at end of queue| pending
   api -.->|AbortSignal| task
   jobs --> signal --> subscribers
   jobs --> retention -->|remove terminal job| jobs
@@ -123,6 +183,7 @@ job state are not shared across processes or persisted across restarts.
 
 - Jobs are retained only in the current process.
 - An active `key` is deduplicated and `add` returns the existing job ID.
+- Failed jobs retry at the end of the queue until `maxAttempts` is exhausted.
 - Cancellation of running work is cooperative through `AbortSignal`.
 - Workers independently observe `restIntervalMs` after finishing a job.
 - Terminal jobs are removed after `retentionMs`; use `0` for immediate removal.

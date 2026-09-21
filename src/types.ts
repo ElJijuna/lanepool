@@ -13,6 +13,7 @@ export interface QueueError {
 export interface JobContext {
   readonly signal: AbortSignal;
   readonly jobId: string;
+  readonly attempt: number;
   readonly key?: string;
   readonly meta?: Readonly<Record<string, unknown>>;
 }
@@ -24,12 +25,15 @@ export type QueueTask<Result = unknown> = (context: JobContext) => Result | Prom
 export interface AddJobOptions {
   readonly key?: string;
   readonly meta?: Readonly<Record<string, unknown>>;
+  readonly maxAttempts?: number;
 }
 
 /** Public, immutable view of a job. */
 export interface Job<Result = unknown> {
   readonly id: string;
   readonly state: JobState;
+  readonly attempt: number;
+  readonly maxAttempts: number;
   readonly key?: string;
   readonly meta?: Readonly<Record<string, unknown>>;
   readonly createdAt: Date;

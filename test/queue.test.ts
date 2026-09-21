@@ -45,6 +45,58 @@ describe('createQueue', () => {
     await queue.close();
   });
 
+  test('retries failed jobs at the end of the queue', async () => {
+    const queue = createQueue({ concurrency: 1, idlePollIntervalMs: 1 });
+    const executionOrder: string[] = [];
+    const retriedId = queue.add(
+      ({ attempt }) => {
+        executionOrder.push(`retried:${attempt}`);
+
+        if (attempt === 1) {
+          throw new Error('temporary failure');
+        }
+
+        return 'inserted';
+      },
+      { maxAttempts: 2 },
+    );
+
+    queue.add(() => {
+      executionOrder.push('next');
+    });
+
+    await waitFor(() => queue.getStats().completed === 2);
+
+    expect(executionOrder).toEqual(['retried:1', 'next', 'retried:2']);
+    expect(queue.getStatus(retriedId)).toMatchObject({
+      state: 'completed',
+      attempt: 2,
+      maxAttempts: 2,
+      result: 'inserted',
+    });
+    await queue.close();
+  });
+
+  test('records the final failure after exhausting attempts', async () => {
+    const queue = createQueue({ idlePollIntervalMs: 1 });
+    const id = queue.add(
+      ({ attempt }) => {
+        throw new Error(`failure ${attempt}`);
+      },
+      { maxAttempts: 2 },
+    );
+
+    await waitFor(() => queue.getStatus(id)?.state === 'failed');
+
+    expect(queue.getStatus(id)).toMatchObject({
+      state: 'failed',
+      attempt: 2,
+      maxAttempts: 2,
+      error: { message: 'failure 2' },
+    });
+    await queue.close();
+  });
+
   test('limits concurrency', async () => {
     const queue = createQueue({ concurrency: 2, idlePollIntervalMs: 1 });
 
@@ -194,6 +246,13 @@ describe('createQueue', () => {
     expect(() => createQueue({ concurrency: 0 })).toThrow(RangeError);
     expect(() => createQueue({ idlePollIntervalMs: 0 })).toThrow(RangeError);
     expect(() => createQueue({ retentionMs: -1 })).toThrow(RangeError);
+  });
+
+  test('validates per-job attempt limits', async () => {
+    const queue = createQueue();
+
+    expect(() => queue.add(() => undefined, { maxAttempts: 0 })).toThrow(RangeError);
+    await queue.close();
   });
 
   test('expires terminal jobs after the retention period using fake timers', async () => {
