@@ -97,6 +97,129 @@ describe('createQueue', () => {
     await queue.close();
   });
 
+  test('runs workflow jobs after their dependencies complete', async () => {
+    const queue = createQueue({ concurrency: 1, idlePollIntervalMs: 1 });
+    const executionOrder: string[] = [];
+    const workflowId = queue.addWorkflow({
+      meta: { orderId: 'order-1' },
+      jobs: {
+        order: {
+          run: () => executionOrder.push('order'),
+        },
+        items: {
+          dependsOn: ['order'],
+          run: () => executionOrder.push('items'),
+        },
+        audit: {
+          dependsOn: ['order'],
+          run: () => executionOrder.push('audit'),
+        },
+        inventory: {
+          dependsOn: ['items'],
+          run: () => executionOrder.push('inventory'),
+        },
+      },
+    });
+
+    await waitFor(() => queue.getWorkflowStatus(workflowId)?.state === 'completed');
+
+    expect(executionOrder).toEqual(['order', 'items', 'audit', 'inventory']);
+    expect(queue.getWorkflowStatus(workflowId)).toMatchObject({
+      state: 'completed',
+      meta: { orderId: 'order-1' },
+      jobs: {
+        order: { state: 'completed', dependsOn: [] },
+        items: { state: 'completed', dependsOn: ['order'] },
+        audit: { state: 'completed', dependsOn: ['order'] },
+        inventory: { state: 'completed', dependsOn: ['items'] },
+      },
+    });
+    await queue.close();
+  });
+
+  test('skips workflow descendants when a dependency fails', async () => {
+    const queue = createQueue({ concurrency: 1, idlePollIntervalMs: 1 });
+    const independent = jest.fn();
+    const descendant = jest.fn();
+    const workflowId = queue.addWorkflow({
+      jobs: {
+        failing: {
+          run: () => {
+            throw new Error('database unavailable');
+          },
+        },
+        descendant: {
+          dependsOn: ['failing'],
+          run: descendant,
+        },
+        independent: {
+          run: independent,
+        },
+      },
+    });
+
+    await waitFor(() => queue.getWorkflowStatus(workflowId)?.state === 'failed');
+
+    expect(independent).toHaveBeenCalledTimes(1);
+    expect(descendant).not.toHaveBeenCalled();
+    expect(queue.getWorkflowStatus(workflowId)).toMatchObject({
+      state: 'failed',
+      jobs: {
+        failing: { state: 'failed' },
+        descendant: { state: 'skipped' },
+        independent: { state: 'completed' },
+      },
+    });
+    await queue.close();
+  });
+
+  test('rejects workflows with missing or cyclic dependencies', async () => {
+    const queue = createQueue();
+
+    expect(() =>
+      queue.addWorkflow({
+        jobs: {
+          child: { dependsOn: ['missing'], run: () => undefined },
+        },
+      }),
+    ).toThrow(RangeError);
+    expect(() =>
+      queue.addWorkflow({
+        jobs: {
+          first: { dependsOn: ['second'], run: () => undefined },
+          second: { dependsOn: ['first'], run: () => undefined },
+        },
+      }),
+    ).toThrow(RangeError);
+    expect(() =>
+      queue.addWorkflow({
+        jobs: {
+          invalid: { maxAttempts: 0, run: () => undefined },
+        },
+      }),
+    ).toThrow(RangeError);
+    await queue.close();
+  });
+
+  test('drains dependent workflow jobs during graceful shutdown', async () => {
+    const queue = createQueue({ idlePollIntervalMs: 1 });
+    const executionOrder: string[] = [];
+    const workflowId = queue.addWorkflow({
+      jobs: {
+        first: { run: () => executionOrder.push('first') },
+        second: {
+          dependsOn: ['first'],
+          run: () => executionOrder.push('second'),
+        },
+      },
+    });
+
+    await queue.close({ drain: true });
+
+    expect(executionOrder).toEqual(['first', 'second']);
+    expect(queue.getWorkflowStatus(workflowId)?.state).toBe('completed');
+  });
+
   test('limits concurrency', async () => {
     const queue = createQueue({ concurrency: 2, idlePollIntervalMs: 1 });
 

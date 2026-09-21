@@ -15,4 +15,10 @@ export type {
   QueueStats,
   QueueSubscribeOptions,
   QueueTask,
+  WorkflowDefinition,
+  WorkflowJobDefinition,
+  WorkflowJobState,
+  WorkflowJobStatus,
+  WorkflowState,
+  WorkflowStatus,
 } from './types.js';

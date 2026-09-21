@@ -86,10 +86,50 @@ export interface CloseOptions {
   readonly drain?: boolean;
 }
 
+/** The lifecycle states exposed for a workflow. */
+export type WorkflowState = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
+
+/** The state of one named job within a workflow. */
+export type WorkflowJobState = 'blocked' | 'pending' | JobState | 'skipped';
+
+/** One named unit of work and the jobs that must complete before it can run. */
+export interface WorkflowJobDefinition<Result = unknown> {
+  readonly run: QueueTask<Result>;
+  readonly dependsOn?: readonly string[];
+  readonly maxAttempts?: number;
+  readonly meta?: Readonly<Record<string, unknown>>;
+}
+
+/** A directed acyclic graph of named jobs. */
+export interface WorkflowDefinition {
+  readonly jobs: Readonly<Record<string, WorkflowJobDefinition>>;
+  readonly meta?: Readonly<Record<string, unknown>>;
+}
+
+/** Public state for one named job in a workflow. */
+export interface WorkflowJobStatus {
+  readonly name: string;
+  readonly state: WorkflowJobState;
+  readonly dependsOn: readonly string[];
+  readonly jobId?: string;
+}
+
+/** Public, immutable view of a workflow and its jobs. */
+export interface WorkflowStatus {
+  readonly id: string;
+  readonly state: WorkflowState;
+  readonly createdAt: Date;
+  readonly finishedAt?: Date;
+  readonly meta?: Readonly<Record<string, unknown>>;
+  readonly jobs: Readonly<Record<string, WorkflowJobStatus>>;
+}
+
 /** Framework-neutral queue contract. */
 export interface Queue {
   add<Result>(task: QueueTask<Result>, options?: AddJobOptions): string;
+  addWorkflow(definition: WorkflowDefinition): string;
   getStatus<Result = unknown>(id: string): JobStatus<Result> | undefined;
+  getWorkflowStatus(id: string): WorkflowStatus | undefined;
   cancel(id: string): boolean;
   pause(): void;
   resume(): void;

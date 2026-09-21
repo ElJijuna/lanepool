@@ -69,6 +69,7 @@ app.post('/webhooks/orders', (request, response) => {
     id: string;
     orderId: string;
     total: number;
+    items: Array<{ sku: string; quantity: number }>;
   };
 
   const jobId = request.queue.add(
@@ -104,6 +105,45 @@ This pattern acknowledges the webhook before the database write finishes. Becaus
 in-memory, a process crash can lose accepted work; use a durable external queue when the webhook
 must have guaranteed delivery. The database operation should still be idempotent because providers
 can redeliver events after the original job has finished.
+
+### Parent jobs with dependencies
+
+Use a workflow when a larger operation contains jobs that must run in a specific order. The workflow
+acts as the parent, while each named entry is a child job in a directed acyclic graph.
+
+```ts
+const workflowId = request.queue.addWorkflow({
+  meta: { eventId: event.id, orderId: event.orderId },
+  jobs: {
+    insertOrder: {
+      maxAttempts: 2,
+      run: () => insertOrder(event),
+    },
+    insertItems: {
+      dependsOn: ['insertOrder'],
+      maxAttempts: 2,
+      run: () => insertItems(event.orderId, event.items),
+    },
+    updateInventory: {
+      dependsOn: ['insertItems'],
+      run: () => updateInventory(event.items),
+    },
+    writeAuditLog: {
+      dependsOn: ['insertOrder', 'updateInventory'],
+      run: () => writeAuditLog(event),
+    },
+  },
+});
+
+const workflow = request.queue.getWorkflowStatus(workflowId);
+console.log(workflow?.state, workflow?.jobs);
+```
+
+Jobs without dependencies are queued immediately. A blocked job is appended to the queue only after
+all its dependencies complete successfully, and it does not occupy a worker while waiting. If a job
+fails after exhausting its attempts or is cancelled, its descendants become `skipped`; independent
+branches continue running. Workflows with missing dependencies or cycles are rejected before any job
+is queued.
 
 ## Framework-neutral usage
 
@@ -184,6 +224,8 @@ job state are not shared across processes or persisted across restarts.
 - Jobs are retained only in the current process.
 - An active `key` is deduplicated and `add` returns the existing job ID.
 - Failed jobs retry at the end of the queue until `maxAttempts` is exhausted.
+- Workflow jobs wait for their dependencies without occupying workers.
+- Failed or cancelled workflow jobs skip their descendants while independent branches continue.
 - Cancellation of running work is cooperative through `AbortSignal`.
 - Workers independently observe `restIntervalMs` after finishing a job.
 - Terminal jobs are removed after `retentionMs`; use `0` for immediate removal.

@@ -14,6 +14,11 @@ import type {
   QueueStats,
   QueueSubscribeOptions,
   QueueTask,
+  WorkflowDefinition,
+  WorkflowJobDefinition,
+  WorkflowJobState,
+  WorkflowState,
+  WorkflowStatus,
 } from './types.js';
 
 interface ReactiveSignal<Value> {
@@ -64,6 +69,25 @@ interface InternalJob {
   task: QueueTask;
   controller: AbortController;
   retentionTimer?: NodeJS.Timeout;
+  workflowId?: string;
+  workflowJobName?: string;
+}
+
+interface InternalWorkflowJob {
+  name: string;
+  state: WorkflowJobState;
+  dependsOn: readonly string[];
+  definition: WorkflowJobDefinition;
+  jobId?: string;
+}
+
+interface InternalWorkflow {
+  id: string;
+  state: WorkflowState;
+  createdAt: Date;
+  finishedAt?: Date;
+  meta?: Readonly<Record<string, unknown>>;
+  jobs: Map<string, InternalWorkflowJob>;
 }
 
 const requireInteger = (name: string, value: number, minimum: number): number => {
@@ -127,6 +151,62 @@ const publicJob = (job: InternalJob): Job => {
 
   return Object.freeze(snapshot);
 };
+const validateWorkflow = (definition: WorkflowDefinition): void => {
+  const entries = Object.entries(definition.jobs);
+
+  if (entries.length === 0) {
+    throw new RangeError('workflow must contain at least one job');
+  }
+
+  const names = new Set(entries.map(([name]) => name));
+
+  for (const [name, job] of entries) {
+    if (name.length === 0) {
+      throw new TypeError('workflow job names cannot be empty');
+    }
+
+    if (typeof job.run !== 'function') {
+      throw new TypeError(`workflow job "${name}" must define a run function`);
+    }
+
+    requireInteger('maxAttempts', job.maxAttempts ?? 1, 1);
+
+    for (const dependency of job.dependsOn ?? []) {
+      if (!names.has(dependency)) {
+        throw new RangeError(`workflow job "${name}" depends on unknown job "${dependency}"`);
+      }
+
+      if (dependency === name) {
+        throw new RangeError(`workflow job "${name}" cannot depend on itself`);
+      }
+    }
+  }
+
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const visit = (name: string): void => {
+    if (visiting.has(name)) {
+      throw new RangeError('workflow dependencies must not contain a cycle');
+    }
+
+    if (visited.has(name)) {
+      return;
+    }
+
+    visiting.add(name);
+
+    for (const dependency of definition.jobs[name]?.dependsOn ?? []) {
+      visit(dependency);
+    }
+
+    visiting.delete(name);
+    visited.add(name);
+  };
+
+  for (const [name] of entries) {
+    visit(name);
+  }
+};
 
 /** Create a new in-memory processing queue. */
 export const createQueue = (options: QueueOptions = {}): Queue => {
@@ -135,6 +215,7 @@ export const createQueue = (options: QueueOptions = {}): Queue => {
   const activeKeys = new Map<string, string>();
   const pendingIds: string[] = [];
   const wakeWaiters = new Set<() => void>();
+  const workflows = new Map<string, InternalWorkflow>();
 
   let paused = false;
   let closed = false;
@@ -198,6 +279,148 @@ export const createQueue = (options: QueueOptions = {}): Queue => {
         wakeWaiters.add(finish);
       }
     });
+  const enqueueJob = <Result>(
+    task: QueueTask<Result>,
+    addOptions: AddJobOptions = {},
+    workflowLink?: { workflowId: string; workflowJobName: string },
+  ): string => {
+    if (closed && (workflowLink === undefined || !drainOnClose)) {
+      throw new QueueClosedError();
+    }
+
+    if (typeof task !== 'function') {
+      throw new TypeError('task must be a function');
+    }
+
+    const maxAttempts = requireInteger('maxAttempts', addOptions.maxAttempts ?? 1, 1);
+
+    if (addOptions.key !== undefined) {
+      const existing = activeKeys.get(addOptions.key);
+
+      if (existing !== undefined) {
+        return existing;
+      }
+    }
+
+    const id = randomUUID();
+    const job: InternalJob = {
+      id,
+      state: 'pending',
+      attempt: 0,
+      maxAttempts,
+      createdAt: new Date(),
+      task,
+      controller: new AbortController(),
+      ...(addOptions.key === undefined ? {} : { key: addOptions.key }),
+      ...(addOptions.meta === undefined ? {} : { meta: Object.freeze({ ...addOptions.meta }) }),
+      ...workflowLink,
+    };
+
+    jobs.set(id, job);
+    pendingIds.push(id);
+
+    if (job.key !== undefined) {
+      activeKeys.set(job.key, id);
+    }
+
+    publish();
+
+    return id;
+  };
+  const workflowJobState = (job: InternalWorkflowJob): WorkflowJobState =>
+    job.jobId === undefined ? job.state : (jobs.get(job.jobId)?.state ?? job.state);
+  const publicWorkflow = (workflow: InternalWorkflow): WorkflowStatus => {
+    const workflowJobs = Object.fromEntries(
+      Array.from(workflow.jobs.values(), (job) => [
+        job.name,
+        Object.freeze({
+          name: job.name,
+          state: workflowJobState(job),
+          dependsOn: Object.freeze([...job.dependsOn]),
+          ...(job.jobId === undefined ? {} : { jobId: job.jobId }),
+        }),
+      ]),
+    );
+
+    return Object.freeze({
+      id: workflow.id,
+      state: workflow.state,
+      createdAt: new Date(workflow.createdAt),
+      ...(workflow.finishedAt === undefined ? {} : { finishedAt: new Date(workflow.finishedAt) }),
+      ...(workflow.meta === undefined ? {} : { meta: Object.freeze({ ...workflow.meta }) }),
+      jobs: Object.freeze(workflowJobs),
+    });
+  };
+  const advanceWorkflow = (workflow: InternalWorkflow): void => {
+    let changed = true;
+
+    while (changed) {
+      changed = false;
+
+      for (const workflowJob of workflow.jobs.values()) {
+        if (workflowJob.state !== 'blocked') {
+          continue;
+        }
+
+        const dependencyStates = workflowJob.dependsOn.map((dependency) =>
+          workflowJobState(workflow.jobs.get(dependency) as InternalWorkflowJob),
+        );
+
+        if (
+          dependencyStates.some((stateName) =>
+            ['failed', 'cancelled', 'skipped'].includes(stateName),
+          )
+        ) {
+          workflowJob.state = 'skipped';
+          changed = true;
+        } else if (dependencyStates.every((stateName) => stateName === 'completed')) {
+          workflowJob.state = 'pending';
+          workflowJob.jobId = enqueueJob(
+            workflowJob.definition.run,
+            {
+              maxAttempts: workflowJob.definition.maxAttempts,
+              meta: workflowJob.definition.meta,
+            },
+            { workflowId: workflow.id, workflowJobName: workflowJob.name },
+          );
+          changed = true;
+        }
+      }
+    }
+
+    const states = Array.from(workflow.jobs.values(), workflowJobState);
+    const terminal = states.every((stateName) =>
+      ['completed', 'failed', 'cancelled', 'skipped'].includes(stateName),
+    );
+
+    if (!terminal) {
+      workflow.state = states.some((stateName) => stateName !== 'blocked') ? 'running' : 'pending';
+
+      return;
+    }
+
+    workflow.state = states.includes('failed')
+      ? 'failed'
+      : states.includes('cancelled')
+        ? 'cancelled'
+        : 'completed';
+    workflow.finishedAt = new Date();
+  };
+  const settleWorkflowJob = (job: InternalJob, stateName: JobState): void => {
+    if (job.workflowId === undefined || job.workflowJobName === undefined) {
+      return;
+    }
+
+    const workflow = workflows.get(job.workflowId);
+    const workflowJob = workflow?.jobs.get(job.workflowJobName);
+
+    if (workflow === undefined || workflowJob === undefined) {
+      return;
+    }
+
+    workflowJob.state = stateName;
+    advanceWorkflow(workflow);
+  };
   const removeRetainedJob = (job: InternalJob): void => {
     if (jobs.delete(job.id)) {
       publish();
@@ -225,6 +448,7 @@ export const createQueue = (options: QueueOptions = {}): Queue => {
 
     publish();
     scheduleRetention(job);
+    settleWorkflowJob(job, stateName);
   };
   const runJob = async (job: InternalJob): Promise<void> => {
     job.state = 'running';
@@ -311,44 +535,37 @@ export const createQueue = (options: QueueOptions = {}): Queue => {
   const workers = Array.from({ length: config.concurrency }, worker);
   const queue: Queue = {
     add<Result>(task: QueueTask<Result>, addOptions: AddJobOptions = {}): string {
+      return enqueueJob(task, addOptions);
+    },
+
+    addWorkflow(definition: WorkflowDefinition): string {
       if (closed) {
         throw new QueueClosedError();
       }
 
-      if (typeof task !== 'function') {
-        throw new TypeError('task must be a function');
-      }
-
-      if (addOptions.key !== undefined) {
-        const existing = activeKeys.get(addOptions.key);
-
-        if (existing !== undefined) {
-          return existing;
-        }
-      }
+      validateWorkflow(definition);
 
       const id = randomUUID();
-      const maxAttempts = requireInteger('maxAttempts', addOptions.maxAttempts ?? 1, 1);
-      const job: InternalJob = {
+      const workflow: InternalWorkflow = {
         id,
         state: 'pending',
-        attempt: 0,
-        maxAttempts,
         createdAt: new Date(),
-        task,
-        controller: new AbortController(),
-        ...(addOptions.key === undefined ? {} : { key: addOptions.key }),
-        ...(addOptions.meta === undefined ? {} : { meta: Object.freeze({ ...addOptions.meta }) }),
+        ...(definition.meta === undefined ? {} : { meta: Object.freeze({ ...definition.meta }) }),
+        jobs: new Map(
+          Object.entries(definition.jobs).map(([name, job]) => [
+            name,
+            {
+              name,
+              state: 'blocked',
+              dependsOn: Object.freeze([...(job.dependsOn ?? [])]),
+              definition: job,
+            },
+          ]),
+        ),
       };
 
-      jobs.set(id, job);
-      pendingIds.push(id);
-
-      if (job.key !== undefined) {
-        activeKeys.set(job.key, id);
-      }
-
-      publish();
+      workflows.set(id, workflow);
+      advanceWorkflow(workflow);
 
       return id;
     },
@@ -357,6 +574,12 @@ export const createQueue = (options: QueueOptions = {}): Queue => {
       const job = jobs.get(id);
 
       return job === undefined ? undefined : (publicJob(job) as Job<Result>);
+    },
+
+    getWorkflowStatus(id: string): WorkflowStatus | undefined {
+      const workflow = workflows.get(id);
+
+      return workflow === undefined ? undefined : publicWorkflow(workflow);
     },
 
     cancel(id: string): boolean {
