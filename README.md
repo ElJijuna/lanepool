@@ -175,6 +175,46 @@ unsubscribe();
 await queue.close({ drain: true });
 ```
 
+## Events
+
+Use `on` for individual lifecycle events and `subscribe` when you need complete reactive snapshots.
+Every listener returns an unsubscribe function and can also be tied to an `AbortSignal`.
+
+```ts
+const queue = createQueue({ concurrency: 4 });
+
+const stopErrors = queue.on('error', ({ job, error, willRetry }) => {
+  logger.error(
+    { jobId: job.id, attempt: job.attempt, willRetry, error },
+    'Queue task failed',
+  );
+});
+
+const stopCompleted = queue.on('completed', ({ job }) => {
+  logger.info({ jobId: job.id, result: job.result }, 'Queue task completed');
+});
+
+const listenerController = new AbortController();
+
+queue.on(
+  'retrying',
+  ({ job, error }) => {
+    console.log(`Retrying ${job.id} after attempt ${job.attempt}: ${error.message}`);
+  },
+  { signal: listenerController.signal },
+);
+
+listenerController.abort();
+stopErrors();
+stopCompleted();
+await queue.close();
+```
+
+The available events are `added`, `started`, `retrying`, `completed`, `failed`, `cancelled`, and
+`error`. The `error` event fires whenever a task attempt throws and includes `willRetry`; `failed`
+fires only after the job exhausts `maxAttempts`. Unlike Node.js `EventEmitter`, an unhandled `error`
+event does not throw, and listener exceptions do not affect job execution.
+
 ## Architecture
 
 ```mermaid
@@ -198,7 +238,7 @@ flowchart LR
     retention[Retention timer]
   end
 
-  subscribers[Subscribers]
+  subscribers[Snapshot and event listeners]
 
   application -->|createQueue| api
   express --> middleware -->|request.queue| api

@@ -81,6 +81,33 @@ export interface QueueSubscribeOptions {
   readonly immediate?: boolean;
 }
 
+/** Payload emitted for a job lifecycle event. */
+export interface QueueJobEvent {
+  readonly job: Job;
+}
+
+/** Payload emitted whenever a task attempt throws. */
+export interface QueueErrorEvent extends QueueJobEvent {
+  readonly error: QueueError;
+  readonly willRetry: boolean;
+}
+
+/** Strongly typed event names and their payloads. */
+export interface QueueEventMap {
+  readonly added: QueueJobEvent;
+  readonly started: QueueJobEvent;
+  readonly retrying: QueueErrorEvent;
+  readonly completed: QueueJobEvent;
+  readonly failed: QueueErrorEvent;
+  readonly cancelled: QueueJobEvent;
+  readonly error: QueueErrorEvent;
+}
+
+/** Event-listener options compatible with the platform AbortSignal. */
+export interface QueueEventOptions {
+  readonly signal?: AbortSignal;
+}
+
 /** Options controlling graceful queue shutdown. */
 export interface CloseOptions {
   readonly drain?: boolean;
@@ -130,6 +157,11 @@ export interface Queue {
   addWorkflow(definition: WorkflowDefinition): string;
   getStatus<Result = unknown>(id: string): JobStatus<Result> | undefined;
   getWorkflowStatus(id: string): WorkflowStatus | undefined;
+  on<EventName extends keyof QueueEventMap>(
+    eventName: EventName,
+    listener: (event: QueueEventMap[EventName]) => void,
+    options?: QueueEventOptions,
+  ): () => void;
   cancel(id: string): boolean;
   pause(): void;
   resume(): void;

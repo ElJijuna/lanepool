@@ -9,6 +9,10 @@ import type {
   JobState,
   Queue,
   QueueError,
+  QueueErrorEvent,
+  QueueEventMap,
+  QueueEventOptions,
+  QueueJobEvent,
   QueueOptions,
   QueueSnapshot,
   QueueStats,
@@ -216,6 +220,10 @@ export const createQueue = (options: QueueOptions = {}): Queue => {
   const pendingIds: string[] = [];
   const wakeWaiters = new Set<() => void>();
   const workflows = new Map<string, InternalWorkflow>();
+  const eventListeners = new Map<
+    keyof QueueEventMap,
+    Set<(event: QueueEventMap[keyof QueueEventMap]) => void>
+  >();
 
   let paused = false;
   let closed = false;
@@ -250,6 +258,27 @@ export const createQueue = (options: QueueOptions = {}): Queue => {
   const publish = (): void => {
     state.value = buildSnapshot();
   };
+  const emit = <EventName extends keyof QueueEventMap>(
+    eventName: EventName,
+    event: QueueEventMap[EventName],
+  ): void => {
+    const listeners = eventListeners.get(eventName);
+
+    if (listeners === undefined) {
+      return;
+    }
+
+    for (const listener of listeners) {
+      try {
+        listener(event);
+      } catch {
+        // Observability callbacks must not change queue execution.
+      }
+    }
+  };
+  const jobEvent = (job: InternalJob): QueueJobEvent => Object.freeze({ job: publicJob(job) });
+  const errorEvent = (job: InternalJob, error: QueueError, willRetry: boolean): QueueErrorEvent =>
+    Object.freeze({ job: publicJob(job), error, willRetry });
   const wake = (): void => {
     for (const resolve of wakeWaiters) {
       resolve();
@@ -324,6 +353,7 @@ export const createQueue = (options: QueueOptions = {}): Queue => {
     }
 
     publish();
+    emit('added', jobEvent(job));
 
     return id;
   };
@@ -449,12 +479,24 @@ export const createQueue = (options: QueueOptions = {}): Queue => {
     publish();
     scheduleRetention(job);
     settleWorkflowJob(job, stateName);
+
+    if (stateName === 'completed') {
+      emit('completed', jobEvent(job));
+    } else if (stateName === 'failed' && job.error !== undefined) {
+      const event = errorEvent(job, job.error, false);
+
+      emit('error', event);
+      emit('failed', event);
+    } else if (stateName === 'cancelled') {
+      emit('cancelled', jobEvent(job));
+    }
   };
   const runJob = async (job: InternalJob): Promise<void> => {
     job.state = 'running';
     job.attempt += 1;
     job.startedAt = new Date();
     publish();
+    emit('started', jobEvent(job));
 
     const context: JobContext = Object.freeze({
       signal: job.controller.signal,
@@ -480,10 +522,17 @@ export const createQueue = (options: QueueOptions = {}): Queue => {
       if (job.cancellationRequestedAt !== undefined) {
         finishJob(job, 'cancelled');
       } else if (job.attempt < job.maxAttempts) {
+        const error = normalizeError(reason);
+
         job.state = 'pending';
         job.startedAt = undefined;
         pendingIds.push(job.id);
         publish();
+
+        const event = errorEvent(job, error, true);
+
+        emit('error', event);
+        emit('retrying', event);
       } else {
         job.error = normalizeError(reason);
         finishJob(job, 'failed');
@@ -580,6 +629,29 @@ export const createQueue = (options: QueueOptions = {}): Queue => {
       const workflow = workflows.get(id);
 
       return workflow === undefined ? undefined : publicWorkflow(workflow);
+    },
+
+    on<EventName extends keyof QueueEventMap>(
+      eventName: EventName,
+      listener: (event: QueueEventMap[EventName]) => void,
+      options?: QueueEventOptions,
+    ): () => void {
+      if (options?.signal?.aborted === true) {
+        return () => undefined;
+      }
+
+      const listeners = eventListeners.get(eventName) ?? new Set();
+      const eventListener = listener as (event: QueueEventMap[keyof QueueEventMap]) => void;
+      const unsubscribe = (): void => {
+        listeners.delete(eventListener);
+        options?.signal?.removeEventListener('abort', unsubscribe);
+      };
+
+      listeners.add(eventListener);
+      eventListeners.set(eventName, listeners);
+      options?.signal?.addEventListener('abort', unsubscribe, { once: true });
+
+      return unsubscribe;
     },
 
     cancel(id: string): boolean {

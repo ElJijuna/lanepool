@@ -97,6 +97,79 @@ describe('createQueue', () => {
     await queue.close();
   });
 
+  test('emits typed lifecycle and error events for every attempt', async () => {
+    const queue = createQueue({ idlePollIntervalMs: 1 });
+    const lifecycle: string[] = [];
+    const errors: Array<{ message: string; willRetry: boolean }> = [];
+
+    for (const eventName of ['added', 'started', 'retrying', 'completed', 'failed'] as const) {
+      queue.on(eventName, () => lifecycle.push(eventName));
+    }
+
+    queue.on('error', ({ error, willRetry }) => {
+      errors.push({ message: error.message, willRetry });
+    });
+
+    const retriedId = queue.add(
+      ({ attempt }) => {
+        if (attempt === 1) {
+          throw new Error('temporary');
+        }
+      },
+      { maxAttempts: 2 },
+    );
+
+    await waitFor(() => queue.getStatus(retriedId)?.state === 'completed');
+
+    const failedId = queue.add(() => {
+      throw new Error('permanent');
+    });
+
+    await waitFor(() => queue.getStatus(failedId)?.state === 'failed');
+
+    expect(lifecycle).toEqual([
+      'added',
+      'started',
+      'retrying',
+      'started',
+      'completed',
+      'added',
+      'started',
+      'failed',
+    ]);
+    expect(errors).toEqual([
+      { message: 'temporary', willRetry: true },
+      { message: 'permanent', willRetry: false },
+    ]);
+    await queue.close();
+  });
+
+  test('unsubscribes event listeners and isolates listener errors', async () => {
+    const queue = createQueue({ idlePollIntervalMs: 1 });
+    const completed = jest.fn();
+    const abortedListener = jest.fn();
+    const abortController = new AbortController();
+    const unsubscribe = queue.on('completed', completed);
+
+    queue.on('completed', () => {
+      throw new Error('listener failure');
+    });
+    queue.on('completed', abortedListener, { signal: abortController.signal });
+    abortController.abort();
+
+    const firstId = queue.add(() => 'first');
+
+    await waitFor(() => queue.getStatus(firstId)?.state === 'completed');
+    unsubscribe();
+
+    const secondId = queue.add(() => 'second');
+
+    await waitFor(() => queue.getStatus(secondId)?.state === 'completed');
+    expect(completed).toHaveBeenCalledTimes(1);
+    expect(abortedListener).not.toHaveBeenCalled();
+    await queue.close();
+  });
+
   test('runs workflow jobs after their dependencies complete', async () => {
     const queue = createQueue({ concurrency: 1, idlePollIntervalMs: 1 });
     const executionOrder: string[] = [];
