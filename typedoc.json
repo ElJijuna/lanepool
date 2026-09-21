@@ -1,0 +1,8 @@
+{
+    "$schema": "https://typedoc.org/schema.json",
+    "extends": "./node_modules/super-configs/typedoc.json",
+    "entryPoints": ["src/index.ts"],
+    "out": "docs/api",
+    "readme": "README.md",
+    "exclude": ["**/*.test.ts", "**/*.spec.ts", "**/test/**"]
+}

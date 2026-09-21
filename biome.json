@@ -1,0 +1,7 @@
+{
+    "$schema": "https://biomejs.dev/schemas/2.5.14/schema.json",
+    "extends": ["super-configs/biome"],
+    "files": {
+        "includes": ["!dist", "!coverage", "!docs/api", "!node_modules", "!package-lock.json"]
+    }
+}

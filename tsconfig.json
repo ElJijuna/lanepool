@@ -1,0 +1,11 @@
+{
+    "extends": "super-configs/tsconfig/node",
+    "compilerOptions": {
+        "rootDir": ".",
+        "outDir": "dist",
+        "declaration": true,
+        "noEmit": true,
+        "types": ["node", "jest"]
+    },
+    "include": ["src/**/*.ts", "test/**/*.ts", "vite.config.ts"]
+}
