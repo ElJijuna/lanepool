@@ -274,6 +274,13 @@ job state are not shared across processes or persisted across restarts.
   milliseconds or a function of the failed attempt number (for exponential backoff, for example).
 - Workflow jobs wait for their dependencies without occupying workers.
 - Failed or cancelled workflow jobs skip their descendants while independent branches continue.
+- lanepool runs entirely on the current Node.js thread. `concurrency` interleaves asynchronous work; it
+  is not OS-level parallelism, and a task cannot run in a `worker_thread` as-is because `QueueTask` is a
+  plain JS function (closures cannot cross a `postMessage` boundary). I/O-bound tasks (awaiting a
+  database call, `fetch`, etc.) never block the thread. For genuinely CPU-bound work, offload that part
+  from within the task itself — with `worker_threads` or a pool like
+  [`piscina`](https://github.com/piscinajs/piscina) — and resolve the task with the result; the queue
+  only ever sees a promise.
 - Cancellation of running work is cooperative through `AbortSignal`.
 - Workers independently observe `restIntervalMs` after finishing a job.
 - Terminal jobs are removed after `retentionMs`; use `0` for immediate removal.
