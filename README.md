@@ -282,3 +282,13 @@ npm run docs
 
 The development configuration is shared through `super-configs`: its ESLint factory enables typed
 Node.js and Jest rules, while Biome, Jest, and TypeDoc extend the corresponding package presets.
+
+## Releases
+
+Versioning, the changelog, npm publishing, and GitHub releases are automated with
+[semantic-release](https://semantic-release.gitbook.io/) based on
+[Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`, etc.) merged
+into `main`. Every push to `main` runs the `Release` workflow, which determines the next version from
+the commit history, updates `CHANGELOG.md`, publishes the package to npm, and creates a GitHub release
+and tag. Pull requests are validated by the `CI` workflow (`npm run check` + `npm run build`) before
+they can be merged.
