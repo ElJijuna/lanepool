@@ -30,6 +30,10 @@ export interface AddJobOptions {
   readonly timeoutMs?: number;
   /** Delay before a failed attempt is re-queued, in milliseconds, or a function of the failed attempt number. */
   readonly retryDelayMs?: number | ((attempt: number) => number);
+  /** Jobs sharing the same `concurrencyKey` are throttled to `concurrencyLimit` running at once. */
+  readonly concurrencyKey?: string;
+  /** Maximum jobs sharing `concurrencyKey` that may run at once. Requires `concurrencyKey`; defaults to 1. */
+  readonly concurrencyLimit?: number;
 }
 
 /** Public, immutable view of a job. */
@@ -39,6 +43,7 @@ export interface Job<Result = unknown> {
   readonly attempt: number;
   readonly maxAttempts: number;
   readonly key?: string;
+  readonly concurrencyKey?: string;
   readonly meta?: Readonly<Record<string, unknown>>;
   readonly createdAt: Date;
   readonly startedAt?: Date;
@@ -130,6 +135,8 @@ export interface WorkflowJobDefinition<Result = unknown> {
   readonly maxAttempts?: number;
   readonly timeoutMs?: number;
   readonly retryDelayMs?: number | ((attempt: number) => number);
+  readonly concurrencyKey?: string;
+  readonly concurrencyLimit?: number;
   readonly meta?: Readonly<Record<string, unknown>>;
 }
 

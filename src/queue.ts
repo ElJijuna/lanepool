@@ -63,6 +63,8 @@ interface InternalJob {
   maxAttempts: number;
   timeoutMs?: number;
   retryDelayMs?: number | ((attempt: number) => number);
+  concurrencyKey?: string;
+  concurrencyLimit?: number;
   key?: string;
   meta?: Readonly<Record<string, unknown>>;
   createdAt: Date;
@@ -110,6 +112,24 @@ const requireRetryDelay = (value: number | ((attempt: number) => number) | undef
 
   requireInteger('retryDelayMs', value, 0);
 };
+const resolveConcurrencyLimit = (
+  concurrencyKey: string | undefined,
+  concurrencyLimit: number | undefined,
+): number | undefined => {
+  if (concurrencyKey === undefined) {
+    if (concurrencyLimit !== undefined) {
+      throw new TypeError('concurrencyLimit requires concurrencyKey');
+    }
+
+    return undefined;
+  }
+
+  if (concurrencyKey.length === 0) {
+    throw new TypeError('concurrencyKey cannot be empty');
+  }
+
+  return requireInteger('concurrencyLimit', concurrencyLimit ?? 1, 1);
+};
 const resolveOptions = (options: QueueOptions): ResolvedQueueOptions => ({
   concurrency: requireInteger('concurrency', options.concurrency ?? DEFAULTS.concurrency, 1),
   restIntervalMs: requireInteger(
@@ -151,6 +171,7 @@ const publicJob = (job: InternalJob): Job => {
     maxAttempts: job.maxAttempts,
     createdAt: new Date(job.createdAt),
     ...(job.key === undefined ? {} : { key: job.key }),
+    ...(job.concurrencyKey === undefined ? {} : { concurrencyKey: job.concurrencyKey }),
     ...(job.meta === undefined ? {} : { meta: Object.freeze({ ...job.meta }) }),
     ...(job.startedAt === undefined ? {} : { startedAt: new Date(job.startedAt) }),
     ...(job.finishedAt === undefined ? {} : { finishedAt: new Date(job.finishedAt) }),
@@ -189,6 +210,7 @@ const validateWorkflow = (definition: WorkflowDefinition): void => {
     }
 
     requireRetryDelay(job.retryDelayMs);
+    resolveConcurrencyLimit(job.concurrencyKey, job.concurrencyLimit);
 
     for (const dependency of job.dependsOn ?? []) {
       if (!names.has(dependency)) {
@@ -232,6 +254,7 @@ export const createQueue = (options: QueueOptions = {}): Queue => {
   const config = resolveOptions(options);
   const jobs = new Map<string, InternalJob>();
   const activeKeys = new Map<string, string>();
+  const concurrencyCounts = new Map<string, number>();
   const pendingIds: string[] = [];
   const wakeWaiters = new Set<() => void>();
   const workflows = new Map<string, InternalWorkflow>();
@@ -353,6 +376,19 @@ export const createQueue = (options: QueueOptions = {}): Queue => {
 
     timer.unref();
   };
+  const adjustConcurrency = (job: InternalJob, delta: 1 | -1): void => {
+    if (job.concurrencyKey === undefined) {
+      return;
+    }
+
+    const next = (concurrencyCounts.get(job.concurrencyKey) ?? 0) + delta;
+
+    if (next <= 0) {
+      concurrencyCounts.delete(job.concurrencyKey);
+    } else {
+      concurrencyCounts.set(job.concurrencyKey, next);
+    }
+  };
   const enqueueJob = <Result>(
     task: QueueTask<Result>,
     addOptions: AddJobOptions = {},
@@ -374,6 +410,11 @@ export const createQueue = (options: QueueOptions = {}): Queue => {
 
     requireRetryDelay(addOptions.retryDelayMs);
 
+    const concurrencyLimit = resolveConcurrencyLimit(
+      addOptions.concurrencyKey,
+      addOptions.concurrencyLimit,
+    );
+
     if (addOptions.key !== undefined) {
       const existing = activeKeys.get(addOptions.key);
 
@@ -393,6 +434,9 @@ export const createQueue = (options: QueueOptions = {}): Queue => {
       controller: new AbortController(),
       ...(addOptions.timeoutMs === undefined ? {} : { timeoutMs: addOptions.timeoutMs }),
       ...(addOptions.retryDelayMs === undefined ? {} : { retryDelayMs: addOptions.retryDelayMs }),
+      ...(addOptions.concurrencyKey === undefined
+        ? {}
+        : { concurrencyKey: addOptions.concurrencyKey, concurrencyLimit }),
       ...(addOptions.key === undefined ? {} : { key: addOptions.key }),
       ...(addOptions.meta === undefined ? {} : { meta: Object.freeze({ ...addOptions.meta }) }),
       ...workflowLink,
@@ -464,6 +508,8 @@ export const createQueue = (options: QueueOptions = {}): Queue => {
               maxAttempts: workflowJob.definition.maxAttempts,
               timeoutMs: workflowJob.definition.timeoutMs,
               retryDelayMs: workflowJob.definition.retryDelayMs,
+              concurrencyKey: workflowJob.definition.concurrencyKey,
+              concurrencyLimit: workflowJob.definition.concurrencyLimit,
               meta: workflowJob.definition.meta,
             },
             { workflowId: workflow.id, workflowJobName: workflowJob.name },
@@ -550,6 +596,7 @@ export const createQueue = (options: QueueOptions = {}): Queue => {
     job.state = 'running';
     job.attempt += 1;
     job.startedAt = new Date();
+    adjustConcurrency(job, 1);
     publish();
     emit('started', jobEvent(job));
 
@@ -612,21 +659,32 @@ export const createQueue = (options: QueueOptions = {}): Queue => {
       if (timeoutTimer !== undefined) {
         clearTimeout(timeoutTimer);
       }
+
+      adjustConcurrency(job, -1);
     }
   };
   const nextPendingJob = (): InternalJob | undefined => {
-    while (pendingIds.length > 0) {
-      const id = pendingIds.shift();
+    for (let index = 0; index < pendingIds.length; index += 1) {
+      const id = pendingIds[index];
+      const job = id === undefined ? undefined : jobs.get(id);
 
-      if (id === undefined) {
-        return undefined;
+      if (job === undefined || job.state !== 'pending') {
+        pendingIds.splice(index, 1);
+        index -= 1;
+
+        continue;
       }
 
-      const job = jobs.get(id);
-
-      if (job?.state === 'pending') {
-        return job;
+      if (
+        job.concurrencyKey !== undefined &&
+        (concurrencyCounts.get(job.concurrencyKey) ?? 0) >= (job.concurrencyLimit ?? 1)
+      ) {
+        continue;
       }
+
+      pendingIds.splice(index, 1);
+
+      return job;
     }
 
     return undefined;

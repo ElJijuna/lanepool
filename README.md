@@ -90,6 +90,8 @@ app.post('/webhooks/orders', (request, response) => {
       maxAttempts: 2,
       timeoutMs: 5_000,
       retryDelayMs: (attempt) => attempt * 500,
+      concurrencyKey: `merchant:${event.merchantId}`,
+      concurrencyLimit: 2,
       meta: { eventId: event.id },
     },
   );
@@ -103,7 +105,10 @@ runs longer than `timeoutMs` (5 seconds here, after which the attempt is aborted
 `AbortSignal` and failed with a `JobTimeoutError`), the job waits `retryDelayMs` — 500ms after the
 first attempt, in this example — before returning to `pending` at the end of the queue. If the
 second execution also throws, the job becomes `failed` and its normalized error is retained. The
-active `key` remains reserved across attempts.
+active `key` remains reserved across attempts. `concurrencyKey` is unrelated to `key`: it does not
+deduplicate, it only caps how many jobs sharing that value — here, webhooks from the same merchant —
+may run at once (`concurrencyLimit: 2`), even though the queue's own `concurrency` may allow more
+work to run in parallel overall.
 
 This pattern acknowledges the webhook before the database write finishes. Because lanepool is
 in-memory, a process crash can lose accepted work; use a durable external queue when the webhook
@@ -267,6 +272,9 @@ job state are not shared across processes or persisted across restarts.
 
 - Jobs are retained only in the current process.
 - An active `key` is deduplicated and `add` returns the existing job ID.
+- `concurrencyKey` throttles unrelated jobs instead of deduplicating them: at most
+  `concurrencyLimit` (default `1`) jobs sharing the same `concurrencyKey` run at once, regardless of
+  the queue's own `concurrency`. Blocked jobs stay `pending` and are picked up in order as slots free up.
 - Failed jobs retry at the end of the queue until `maxAttempts` is exhausted.
 - `timeoutMs` aborts and fails an attempt that runs too long; the abort is cooperative
   through `AbortSignal`, but the attempt is always treated as failed once the timeout fires.

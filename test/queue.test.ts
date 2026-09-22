@@ -337,6 +337,13 @@ describe('createQueue', () => {
         },
       }),
     ).toThrow(RangeError);
+    expect(() =>
+      queue.addWorkflow({
+        jobs: {
+          invalid: { concurrencyLimit: 2, run: () => undefined },
+        },
+      }),
+    ).toThrow(TypeError);
     await queue.close();
   });
 
@@ -387,6 +394,105 @@ describe('createQueue', () => {
     releases[0]?.();
     await waitFor(() => queue.getStats().completed === 3);
     expect(maximum).toBe(2);
+    await queue.close();
+  });
+
+  test('serializes jobs sharing a concurrencyKey by default, independent of global concurrency', async () => {
+    const queue = createQueue({ concurrency: 3, idlePollIntervalMs: 1 });
+    const releases: Array<() => void> = [];
+    const task = (): Promise<void> => new Promise((resolve) => releases.push(resolve));
+    const firstId = queue.add(task, { concurrencyKey: 'tenant:a' });
+
+    queue.add(task, { concurrencyKey: 'tenant:a' });
+    queue.add(task, { concurrencyKey: 'tenant:a' });
+
+    await waitFor(() => releases.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    expect(releases).toHaveLength(1);
+    expect(queue.getStatus(firstId)?.concurrencyKey).toBe('tenant:a');
+
+    releases[0]?.();
+    await waitFor(() => releases.length === 2);
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    expect(releases).toHaveLength(2);
+
+    releases[1]?.();
+    await waitFor(() => releases.length === 3);
+    releases[2]?.();
+
+    await waitFor(() => queue.getStats().completed === 3);
+    await queue.close();
+  });
+
+  test('allows up to concurrencyLimit jobs of the same key to run at once', async () => {
+    const queue = createQueue({ concurrency: 3, idlePollIntervalMs: 1 });
+    const releases: Array<() => void> = [];
+    const task = (): Promise<void> => new Promise((resolve) => releases.push(resolve));
+
+    queue.add(task, { concurrencyKey: 'tenant:a', concurrencyLimit: 2 });
+    queue.add(task, { concurrencyKey: 'tenant:a', concurrencyLimit: 2 });
+    queue.add(task, { concurrencyKey: 'tenant:a', concurrencyLimit: 2 });
+
+    await waitFor(() => releases.length === 2);
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    expect(releases).toHaveLength(2);
+
+    releases[0]?.();
+    await waitFor(() => releases.length === 3);
+    releases[1]?.();
+    releases[2]?.();
+
+    await waitFor(() => queue.getStats().completed === 3);
+    await queue.close();
+  });
+
+  test('does not block jobs with a different concurrencyKey', async () => {
+    const queue = createQueue({ concurrency: 2, idlePollIntervalMs: 1 });
+    const releases: Array<() => void> = [];
+    const blocked = (): Promise<void> => new Promise((resolve) => releases.push(resolve));
+
+    queue.add(blocked, { concurrencyKey: 'tenant:a' });
+    queue.add(blocked, { concurrencyKey: 'tenant:a' });
+    const independentId = queue.add(() => 'independent', { concurrencyKey: 'tenant:b' });
+
+    await waitFor(() => queue.getStatus(independentId)?.state === 'completed');
+
+    releases[0]?.();
+    await waitFor(() => releases.length === 2);
+    releases[1]?.();
+    await waitFor(() => queue.getStats().completed === 3);
+    await queue.close();
+  });
+
+  test('drain waits for a job blocked by concurrencyLimit', async () => {
+    const queue = createQueue({ concurrency: 2, idlePollIntervalMs: 1 });
+    const finished: string[] = [];
+
+    queue.add(
+      () =>
+        new Promise<void>((resolve) => {
+          setTimeout(() => {
+            finished.push('first');
+            resolve();
+          }, 20);
+        }),
+      { concurrencyKey: 'tenant:a', concurrencyLimit: 1 },
+    );
+    queue.add(() => finished.push('second'), { concurrencyKey: 'tenant:a', concurrencyLimit: 1 });
+
+    await queue.close();
+
+    expect(finished).toEqual(['first', 'second']);
+  });
+
+  test('validates concurrencyKey and concurrencyLimit options', async () => {
+    const queue = createQueue();
+
+    expect(() => queue.add(() => undefined, { concurrencyLimit: 2 })).toThrow(TypeError);
+    expect(() => queue.add(() => undefined, { concurrencyKey: '' })).toThrow(TypeError);
+    expect(() =>
+      queue.add(() => undefined, { concurrencyKey: 'tenant:a', concurrencyLimit: 0 }),
+    ).toThrow(RangeError);
     await queue.close();
   });
 
