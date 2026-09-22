@@ -504,6 +504,29 @@ describe('createQueue', () => {
     expect(cancellingQueue.getStatus(cancelledId)?.state).toBe('cancelled');
   });
 
+  test('drain waits for a retry that is still in its backoff delay', async () => {
+    const queue = createQueue({ concurrency: 1, idlePollIntervalMs: 1 });
+    const attempts: number[] = [];
+    const id = queue.add(
+      ({ attempt }) => {
+        attempts.push(attempt);
+
+        if (attempt === 1) {
+          throw new Error('temporary failure');
+        }
+
+        return 'recovered';
+      },
+      { maxAttempts: 2, retryDelayMs: 30 },
+    );
+
+    await waitFor(() => attempts.length === 1);
+    await queue.close();
+
+    expect(attempts).toEqual([1, 2]);
+    expect(queue.getStatus(id)).toMatchObject({ state: 'completed', result: 'recovered' });
+  });
+
   test('validates construction options', () => {
     expect(() => createQueue({ concurrency: 0 })).toThrow(RangeError);
     expect(() => createQueue({ idlePollIntervalMs: 0 })).toThrow(RangeError);

@@ -243,6 +243,7 @@ export const createQueue = (options: QueueOptions = {}): Queue => {
   let paused = false;
   let closed = false;
   let drainOnClose = true;
+  let scheduledRetries = 0;
 
   const buildStats = (): QueueStats => {
     const counts: Record<JobState, number> = {
@@ -342,7 +343,10 @@ export const createQueue = (options: QueueOptions = {}): Queue => {
       return;
     }
 
+    scheduledRetries += 1;
+
     const timer = setTimeout(() => {
+      scheduledRetries -= 1;
       pendingIds.push(job.id);
       wake();
     }, delayMs);
@@ -629,7 +633,7 @@ export const createQueue = (options: QueueOptions = {}): Queue => {
   };
   const worker = async (): Promise<void> => {
     while (true) {
-      if (closed && (!drainOnClose || pendingIds.length === 0)) {
+      if (closed && (!drainOnClose || (pendingIds.length === 0 && scheduledRetries === 0))) {
         return;
       }
 
