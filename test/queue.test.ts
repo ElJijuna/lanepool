@@ -97,6 +97,58 @@ describe('createQueue', () => {
     await queue.close();
   });
 
+  test('aborts and fails an attempt that exceeds timeoutMs', async () => {
+    const queue = createQueue({ idlePollIntervalMs: 1 });
+
+    let observedAbort = false;
+
+    const id = queue.add(
+      ({ signal }) =>
+        new Promise<void>((resolve) => {
+          signal.addEventListener(
+            'abort',
+            () => {
+              observedAbort = true;
+              resolve();
+            },
+            { once: true },
+          );
+        }),
+      { timeoutMs: 5 },
+    );
+
+    await waitFor(() => queue.getStatus(id)?.state === 'failed');
+
+    expect(observedAbort).toBe(true);
+    expect(queue.getStatus(id)?.error).toMatchObject({ name: 'JobTimeoutError' });
+    await queue.close();
+  });
+
+  test('retries a timed-out attempt when attempts remain', async () => {
+    const queue = createQueue({ idlePollIntervalMs: 1 });
+    const attempts: number[] = [];
+    const id = queue.add(
+      ({ attempt, signal }) => {
+        attempts.push(attempt);
+
+        if (attempt === 1) {
+          return new Promise<string>(() => {
+            signal.addEventListener('abort', () => undefined, { once: true });
+          });
+        }
+
+        return 'recovered';
+      },
+      { maxAttempts: 2, timeoutMs: 5 },
+    );
+
+    await waitFor(() => queue.getStatus(id)?.state === 'completed');
+
+    expect(attempts).toEqual([1, 2]);
+    expect(queue.getStatus(id)).toMatchObject({ state: 'completed', result: 'recovered' });
+    await queue.close();
+  });
+
   test('emits typed lifecycle and error events for every attempt', async () => {
     const queue = createQueue({ idlePollIntervalMs: 1 });
     const lifecycle: string[] = [];
@@ -268,6 +320,20 @@ describe('createQueue', () => {
       queue.addWorkflow({
         jobs: {
           invalid: { maxAttempts: 0, run: () => undefined },
+        },
+      }),
+    ).toThrow(RangeError);
+    expect(() =>
+      queue.addWorkflow({
+        jobs: {
+          invalid: { timeoutMs: 0, run: () => undefined },
+        },
+      }),
+    ).toThrow(RangeError);
+    expect(() =>
+      queue.addWorkflow({
+        jobs: {
+          invalid: { retryDelayMs: -1, run: () => undefined },
         },
       }),
     ).toThrow(RangeError);
@@ -448,6 +514,57 @@ describe('createQueue', () => {
     const queue = createQueue();
 
     expect(() => queue.add(() => undefined, { maxAttempts: 0 })).toThrow(RangeError);
+    expect(() => queue.add(() => undefined, { timeoutMs: 0 })).toThrow(RangeError);
+    expect(() => queue.add(() => undefined, { retryDelayMs: -1 })).toThrow(RangeError);
+    await queue.close();
+  });
+
+  test('delays a retry by a fixed retryDelayMs', async () => {
+    const queue = createQueue({ concurrency: 1, idlePollIntervalMs: 1 });
+    const timestamps: number[] = [];
+    const id = queue.add(
+      ({ attempt }) => {
+        timestamps.push(Date.now());
+
+        if (attempt === 1) {
+          throw new Error('temporary failure');
+        }
+
+        return 'recovered';
+      },
+      { maxAttempts: 2, retryDelayMs: 40 },
+    );
+
+    await waitFor(() => queue.getStatus(id)?.state === 'completed');
+
+    expect(timestamps).toHaveLength(2);
+    expect(timestamps[1] - timestamps[0]).toBeGreaterThanOrEqual(35);
+    expect(queue.getStatus(id)).toMatchObject({ state: 'completed', result: 'recovered' });
+    await queue.close();
+  });
+
+  test('derives the retry delay from the failed attempt number', async () => {
+    const queue = createQueue({ concurrency: 1, idlePollIntervalMs: 1 });
+    const seenAttempts: number[] = [];
+    const retryDelayMs = jest.fn((attempt: number) => {
+      seenAttempts.push(attempt);
+
+      return 1;
+    });
+    const id = queue.add(
+      ({ attempt }) => {
+        if (attempt < 3) {
+          throw new Error(`failure ${attempt}`);
+        }
+
+        return 'done';
+      },
+      { maxAttempts: 3, retryDelayMs },
+    );
+
+    await waitFor(() => queue.getStatus(id)?.state === 'completed');
+
+    expect(seenAttempts).toEqual([1, 2]);
     await queue.close();
   });
 

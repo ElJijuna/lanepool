@@ -1,4 +1,4 @@
-export { QueueClosedError } from './errors.js';
+export { JobTimeoutError, QueueClosedError } from './errors.js';
 export { createQueueMiddleware } from './middleware.js';
 export { createQueue } from './queue.js';
 export type {

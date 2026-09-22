@@ -88,6 +88,8 @@ app.post('/webhooks/orders', (request, response) => {
     {
       key: `webhook:${event.id}`,
       maxAttempts: 2,
+      timeoutMs: 5_000,
+      retryDelayMs: (attempt) => attempt * 500,
       meta: { eventId: event.id },
     },
   );
@@ -96,8 +98,10 @@ app.post('/webhooks/orders', (request, response) => {
 });
 ```
 
-`maxAttempts: 2` means one initial execution and one retry. If the first execution throws, the job
-returns to `pending` at the end of the queue, allowing already queued work to run first. If the
+`maxAttempts: 2` means one initial execution and one retry. If the first execution throws, or if it
+runs longer than `timeoutMs` (5 seconds here, after which the attempt is aborted through
+`AbortSignal` and failed with a `JobTimeoutError`), the job waits `retryDelayMs` — 500ms after the
+first attempt, in this example — before returning to `pending` at the end of the queue. If the
 second execution also throws, the job becomes `failed` and its normalized error is retained. The
 active `key` remains reserved across attempts.
 
@@ -264,6 +268,10 @@ job state are not shared across processes or persisted across restarts.
 - Jobs are retained only in the current process.
 - An active `key` is deduplicated and `add` returns the existing job ID.
 - Failed jobs retry at the end of the queue until `maxAttempts` is exhausted.
+- `timeoutMs` aborts and fails an attempt that runs too long; the abort is cooperative
+  through `AbortSignal`, but the attempt is always treated as failed once the timeout fires.
+- `retryDelayMs` delays a retry after a failed attempt, either by a fixed number of
+  milliseconds or a function of the failed attempt number (for exponential backoff, for example).
 - Workflow jobs wait for their dependencies without occupying workers.
 - Failed or cancelled workflow jobs skip their descendants while independent branches continue.
 - Cancellation of running work is cooperative through `AbortSignal`.

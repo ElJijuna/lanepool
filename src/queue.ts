@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import SSignal from 'ssignal';
-import { QueueClosedError } from './errors.js';
+import { JobTimeoutError, QueueClosedError } from './errors.js';
 import type {
   AddJobOptions,
   CloseOptions,
@@ -61,6 +61,8 @@ interface InternalJob {
   state: JobState;
   attempt: number;
   maxAttempts: number;
+  timeoutMs?: number;
+  retryDelayMs?: number | ((attempt: number) => number);
   key?: string;
   meta?: Readonly<Record<string, unknown>>;
   createdAt: Date;
@@ -100,6 +102,13 @@ const requireInteger = (name: string, value: number, minimum: number): number =>
   }
 
   return value;
+};
+const requireRetryDelay = (value: number | ((attempt: number) => number) | undefined): void => {
+  if (value === undefined || typeof value === 'function') {
+    return;
+  }
+
+  requireInteger('retryDelayMs', value, 0);
 };
 const resolveOptions = (options: QueueOptions): ResolvedQueueOptions => ({
   concurrency: requireInteger('concurrency', options.concurrency ?? DEFAULTS.concurrency, 1),
@@ -174,6 +183,12 @@ const validateWorkflow = (definition: WorkflowDefinition): void => {
     }
 
     requireInteger('maxAttempts', job.maxAttempts ?? 1, 1);
+
+    if (job.timeoutMs !== undefined) {
+      requireInteger('timeoutMs', job.timeoutMs, 1);
+    }
+
+    requireRetryDelay(job.retryDelayMs);
 
     for (const dependency of job.dependsOn ?? []) {
       if (!names.has(dependency)) {
@@ -308,6 +323,32 @@ export const createQueue = (options: QueueOptions = {}): Queue => {
         wakeWaiters.add(finish);
       }
     });
+  const resolveRetryDelay = (job: InternalJob): number => {
+    if (job.retryDelayMs === undefined) {
+      return 0;
+    }
+
+    const delay =
+      typeof job.retryDelayMs === 'function' ? job.retryDelayMs(job.attempt) : job.retryDelayMs;
+
+    return Number.isFinite(delay) && delay > 0 ? delay : 0;
+  };
+  const scheduleRetry = (job: InternalJob): void => {
+    const delayMs = resolveRetryDelay(job);
+
+    if (delayMs <= 0) {
+      pendingIds.push(job.id);
+
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      pendingIds.push(job.id);
+      wake();
+    }, delayMs);
+
+    timer.unref();
+  };
   const enqueueJob = <Result>(
     task: QueueTask<Result>,
     addOptions: AddJobOptions = {},
@@ -322,6 +363,12 @@ export const createQueue = (options: QueueOptions = {}): Queue => {
     }
 
     const maxAttempts = requireInteger('maxAttempts', addOptions.maxAttempts ?? 1, 1);
+
+    if (addOptions.timeoutMs !== undefined) {
+      requireInteger('timeoutMs', addOptions.timeoutMs, 1);
+    }
+
+    requireRetryDelay(addOptions.retryDelayMs);
 
     if (addOptions.key !== undefined) {
       const existing = activeKeys.get(addOptions.key);
@@ -340,6 +387,8 @@ export const createQueue = (options: QueueOptions = {}): Queue => {
       createdAt: new Date(),
       task,
       controller: new AbortController(),
+      ...(addOptions.timeoutMs === undefined ? {} : { timeoutMs: addOptions.timeoutMs }),
+      ...(addOptions.retryDelayMs === undefined ? {} : { retryDelayMs: addOptions.retryDelayMs }),
       ...(addOptions.key === undefined ? {} : { key: addOptions.key }),
       ...(addOptions.meta === undefined ? {} : { meta: Object.freeze({ ...addOptions.meta }) }),
       ...workflowLink,
@@ -409,6 +458,8 @@ export const createQueue = (options: QueueOptions = {}): Queue => {
             workflowJob.definition.run,
             {
               maxAttempts: workflowJob.definition.maxAttempts,
+              timeoutMs: workflowJob.definition.timeoutMs,
+              retryDelayMs: workflowJob.definition.retryDelayMs,
               meta: workflowJob.definition.meta,
             },
             { workflowId: workflow.id, workflowJobName: workflowJob.name },
@@ -506,8 +557,24 @@ export const createQueue = (options: QueueOptions = {}): Queue => {
       ...(job.meta === undefined ? {} : { meta: job.meta }),
     });
 
+    let timeoutTimer: NodeJS.Timeout | undefined;
+
     try {
-      const result = await job.task(context);
+      const taskPromise = job.task(context);
+      const result = await (job.timeoutMs === undefined
+        ? taskPromise
+        : Promise.race([
+            taskPromise,
+            new Promise<never>((_resolve, reject) => {
+              timeoutTimer = setTimeout(() => {
+                // Reject before aborting: a task's own abort listener may settle
+                // synchronously, and rejecting first guarantees the timeout wins the race.
+                reject(new JobTimeoutError(job.timeoutMs as number));
+                job.controller.abort();
+              }, job.timeoutMs);
+              timeoutTimer.unref();
+            }),
+          ]));
 
       if (job.cancellationRequestedAt !== undefined) {
         finishJob(job, 'cancelled');
@@ -526,16 +593,20 @@ export const createQueue = (options: QueueOptions = {}): Queue => {
 
         job.state = 'pending';
         job.startedAt = undefined;
-        pendingIds.push(job.id);
         publish();
 
         const event = errorEvent(job, error, true);
 
         emit('error', event);
         emit('retrying', event);
+        scheduleRetry(job);
       } else {
         job.error = normalizeError(reason);
         finishJob(job, 'failed');
+      }
+    } finally {
+      if (timeoutTimer !== undefined) {
+        clearTimeout(timeoutTimer);
       }
     }
   };

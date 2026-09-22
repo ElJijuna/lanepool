@@ -26,6 +26,10 @@ export interface AddJobOptions {
   readonly key?: string;
   readonly meta?: Readonly<Record<string, unknown>>;
   readonly maxAttempts?: number;
+  /** Aborts and fails an attempt that runs longer than this, in milliseconds. */
+  readonly timeoutMs?: number;
+  /** Delay before a failed attempt is re-queued, in milliseconds, or a function of the failed attempt number. */
+  readonly retryDelayMs?: number | ((attempt: number) => number);
 }
 
 /** Public, immutable view of a job. */
@@ -124,6 +128,8 @@ export interface WorkflowJobDefinition<Result = unknown> {
   readonly run: QueueTask<Result>;
   readonly dependsOn?: readonly string[];
   readonly maxAttempts?: number;
+  readonly timeoutMs?: number;
+  readonly retryDelayMs?: number | ((attempt: number) => number);
   readonly meta?: Readonly<Record<string, unknown>>;
 }
 
