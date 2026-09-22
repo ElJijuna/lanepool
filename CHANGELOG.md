@@ -1,3 +1,10 @@
+# [1.1.0](https://github.com/ElJijuna/lanepool/compare/v1.0.0...v1.1.0) (2026-09-22)
+
+
+### Features
+
+* add concurrencyKey and concurrencyLimit options for job processing ([3e9a76a](https://github.com/ElJijuna/lanepool/commit/3e9a76a3a994f76cd71a044a8d44d9a13f6e609e))
+
 # 1.0.0 (2026-09-22)
 
 

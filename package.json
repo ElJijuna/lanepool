@@ -1,6 +1,6 @@
 {
     "name": "lanepool",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "description": "In-memory processing queue for Node.js with an Express adapter.",
     "type": "module",
     "main": "./dist/index.cjs",
